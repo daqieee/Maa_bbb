@@ -32,6 +32,9 @@ jobs:
             python -m pip install --upgrade maafw --pre
             python -m pip install json-with-comments
 
+      - name: Test Affix Reroll
+        run: python -m unittest discover -s tests -p "test_affix*.py"
+
       - name: Check Resource
         run: |
             python ./tools/check_resource.py ./assets/interface.json

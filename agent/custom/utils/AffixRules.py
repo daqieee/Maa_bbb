@@ -14,10 +14,10 @@
        只要文本里出现的武器全部属于所选武器组即有效
        （不要求列全该组武器，也不要求顺序一致）
     3. 无条件类：形如 "攻击提升xx.x"，任何属性/武器的角色都有效
-    其余一律视为无效词缀，按 0 计。
+    已知非攻击词缀按 0 计；无法确认的文本标为存疑，禁止据此写入。
 
 设计说明：本模块只有纯函数，方便用普通 Python 直接跑单测
-（见 tools/test_affix_rules.py），不需要启动游戏或 MaaFramework。
+（见 tests/test_affix_rules.py），不需要启动游戏或 MaaFramework。
 """
 
 from __future__ import annotations
@@ -49,9 +49,9 @@ ATTRIBUTE_ALIASES: Dict[str, Tuple[str, ...]] = {
 WEAPON_GROUPS: "Dict[str, Tuple[Tuple[str, ...], ...]]" = {
     "大剑、拳套": (("大剑", "大刽"), ("拳套", "拳査")),
     "太刀、十字架、链刃": (("太刀",), ("十字架", "十字加"), ("链刃", "链刀")),
-    "弓箭、环刃": (("弓箭", "弓箭"), ("环刃", "环刀", "环刃")),
+    "弓箭、环刃": (("弓箭",), ("环刃", "环刀")),
     "重炮、镰刀、火箭锤": (("重炮", "重砲"), ("镰刀", "鎌刀"), ("火箭锤", "火箭鎚")),
-    "梭镖、驱动核心、机关杖": (("梭镖", "梭镳", "棱镖"), ("驱动核心",), ("机关杖", "机关杖")),
+    "梭镖、驱动核心、机关杖": (("梭镖", "梭镳", "棱镖"), ("驱动核心",), ("机关杖",)),
     "双枪、骑枪、速射弩": (("双枪",), ("骑枪",), ("速射弩", "速射弓")),
 }
 
@@ -98,20 +98,11 @@ KIND_INVALID = "无效"
 KIND_AMBIGUOUS = "存疑"
 KIND_UNREADABLE = "未识别"
 
-#: 已知的“非攻击”词缀关键词。把「提升」和这些词放在一起的，就是确定的无效词缀。
-#: 不在这个表里、却带「提升」+数字的，宁可标成“存疑”也不当成 0。
-#: 想扩展直接往这里加即可（日志里 `(存疑…)` 的行就是候选）。
+#: 已知非攻击词缀的关键词；其它无法解析的文本不可按 0 计。
 NON_ATTACK_KEYWORDS: Tuple[str, ...] = (
     "生命", "会心", "暴击", "能量", "伤害", "护盾", "防御", "抗性",
     "回复", "速度", "全伤", "冰冻", "火焰", "雷电", "物理", "元素",
 )
-
-#: “攻击提升”这四个字的指纹：命中两个及以上、又不是已知非攻击词缀就判为存疑
-_ATTACK_FINGERPRINT: Tuple[str, ...] = ("攻", "击", "提", "升")
-
-#: 分隔符（、，,/|·空格 等）
-_SEPARATORS = "、，,／/|·・\\ 　+＆&"
-
 
 # --------------------------------------------------------------------------
 # 2. 文本归一化与数值提取
@@ -121,18 +112,10 @@ _SEPARATORS = "、，,／/|·・\\ 　+＆&"
 def is_affix_text_plausible(text: object) -> bool:
     """OCR 结果看起来是不是“一条真正的词缀”，而不是噪声。
 
-    游戏里每条词缀都带数值（攻击提升9.0 / 生命上限提升157.7 / 会心提升6.3 …），
-    所以判据是：**至少要有一个数字，并且至少两个汉字**。
-
-    这个判据是被真实日志逼出来的：某次运行里有 26 轮把
-    「重炮、镰刀、火箭锤角色攻击提升22.7」读成了「核心」，
-    于是那一侧的有效总攻击力从 31.7 掉到 9.0，程序就以为
-    新刷出来的 12.3 更好，去点了「写入新词缀」——差点把一条好词缀冲掉。
-    所以凡是这种“读不出数字”的行，一律当作没读到，交给上层重试或放弃。
+    每条词缀都带数值，因此要求至少一个数字和两个汉字。
+    缺失数值的文本不可按 0 计，否则会低估旧词缀而错误覆盖。
     """
     norm = normalize_text(text)
-    if not norm:
-        return False
     if not _DIGIT_RE.search(norm):
         return False
     return len(_CJK_CHAR_RE.findall(norm)) >= 2
@@ -163,28 +146,17 @@ def extract_attack_value(text: str) -> Optional[float]:
         return None
 
     tail = norm[match.end() : match.end() + 12]
-    # 小数点被识别成逗号的情况
-    tail = re.sub(r"(?<=\d)[,，](?=\d)", ".", tail)
     tail = tail.translate(_OCR_DIGIT_MAP)
 
     for num_match in _NUM_RE.finditer(tail):
         raw = num_match.group(0).replace(",", ".")
-        try:
-            value = float(raw)
-        except ValueError:
-            continue
+        value = float(raw)
         if value <= 0:
             continue
         if value > _VALUE_MAX:
             # 多半是小数点被 OCR 吃掉了，例如 22.7 -> 227、13.0 -> 130
-            digits = raw.replace(".", "")
-            if "." not in raw and len(digits) >= 2:
-                try:
-                    fixed = float(digits[:-1] + "." + digits[-1])
-                except ValueError:
-                    continue
-                if 0 < fixed <= _VALUE_MAX:
-                    return fixed
+            if "." not in raw and value / 10 <= _VALUE_MAX:
+                return value / 10
             continue
         return value
     return None
@@ -202,8 +174,6 @@ def _condition_part(text: str) -> Optional[str]:
     for noise in _NOISE_WORDS:
         cond = cond.replace(noise, "")
     cond = cond.replace("角色", "")
-    for sep in _SEPARATORS:
-        cond = cond.replace(sep, "")
     return cond
 
 
@@ -213,7 +183,7 @@ def canonical_attribute(attribute: str) -> Optional[str]:
         return None
     text = str(attribute).strip()
     for canonical, aliases in ATTRIBUTE_ALIASES.items():
-        if text == canonical or text in aliases:
+        if text in aliases:
             return canonical
     return None
 
@@ -259,20 +229,16 @@ def match_attribute(cond: str) -> Optional[str]:
                 return canonical
 
     if len(cond) == 2:
-        scored: List[Tuple[int, str]] = []
-        for canonical, aliases in ATTRIBUTE_ALIASES.items():
-            score = 0
-            for alias in aliases:
-                if len(alias) != 2:
-                    continue
-                score = max(
-                    score,
-                    sum(1 for a, b in zip(cond, alias) if _char_match(a, b)),
-                )
-            scored.append((score, canonical))
-        scored.sort(reverse=True)
-        if scored and scored[0][0] == 2 and (len(scored) == 1 or scored[0][0] > scored[1][0]):
-            return scored[0][1]
+        matches = {
+            canonical
+            for canonical, aliases in ATTRIBUTE_ALIASES.items()
+            if any(
+                len(alias) == 2 and all(_char_match(a, b) for a, b in zip(cond, alias))
+                for alias in aliases
+            )
+        }
+        if len(matches) == 1:
+            return matches.pop()
     return None
 
 
@@ -322,14 +288,7 @@ def weapon_group_verdict(cond: str, group_name: str) -> str:
             return "ambiguous"
         return "match" if groups == {group_name} else "foreign"
 
-    # 一把武器都没认出来：退回“把本组武器名全部抠掉后是否为空”的老办法
-    tokens = WEAPON_GROUPS.get(group_name) or ()
-    rest = cond
-    for alias in sorted((a for t in tokens for a in t), key=len, reverse=True):
-        rest = rest.replace(alias, "")
-    for sep in _SEPARATORS:
-        rest = rest.replace(sep, "")
-    return "match" if rest == "" else "ambiguous"
+    return "ambiguous"
 
 
 # --------------------------------------------------------------------------
@@ -373,6 +332,17 @@ class AffixLine:
         return f"{self.raw}({self.kind})"
 
 
+def same_affix(a: AffixLine, b: AffixLine) -> bool:
+    """仅用可信的完整文本确认同一词缀，不以类型和数值推断条件相同。"""
+    return (
+        a.trustworthy
+        and b.trustworthy
+        and a.plausible
+        and b.plausible
+        and normalize_text(a.raw) == normalize_text(b.raw)
+    )
+
+
 def classify_line(
     text: str,
     attribute: str,
@@ -406,21 +376,13 @@ def classify_line(
 
     if cond is None:
         norm = normalize_text(raw)
-        # 「攻击提升」这四个字里命中两个及以上，又不是已知的非攻击词缀
-        # -> 多半是它们被认错了（攻击->攻去、提升->提丹…）。
-        # 这种情况绝对不能算成 0：真实日志里就是这么把 31.7 低估成 9.0 的。
-        # 用“命中两个字”而不是写死「提升」，是为了连“升”也被认错时仍能兜住。
-        fingerprint = sum(1 for ch in _ATTACK_FINGERPRINT if ch in norm)
-        if fingerprint >= 2 and not any(k in norm for k in NON_ATTACK_KEYWORDS):
-            line.kind = KIND_AMBIGUOUS
-            line.trustworthy = False
-            line.note = (
-                f"疑似“攻击提升”被认错（命中 {fingerprint} 个字），"
-                f"也不是已知的非攻击词缀"
-            )
+        if any(k in norm for k in NON_ATTACK_KEYWORDS):
+            line.kind = KIND_INVALID
+            line.note = "已知的非攻击词缀"
             return line
-        line.kind = KIND_INVALID
-        line.note = "不含“攻击提升”（属于其它类型词缀，确定的 0）"
+        line.kind = KIND_AMBIGUOUS
+        line.trustworthy = False
+        line.note = "无法确认词缀类型，不可按 0 计"
         return line
 
     line.shown = value
@@ -511,14 +473,13 @@ def evaluate_side(
     result.total = round(sum(line.value for line in lines), 4)
     result.readable = any(line.readable for line in lines)
     # 只要有一行“存疑”（疑似认错的攻击词条），这一侧就不许用来做写入判断
-    result.reliable = all(line.trustworthy for line in lines)
+    result.reliable = bool(lines) and all(line.trustworthy for line in lines)
     return result
 
 
 def validate_selection(attribute: str, weapon_group: str) -> Optional[str]:
     """校验下拉框选项是否合法，合法返回 None，否则返回错误说明。"""
-    known_attribute = any(attribute in aliases for aliases in ATTRIBUTE_ALIASES.values())
-    if not known_attribute:
+    if canonical_attribute(attribute) is None:
         return f"未知的角色属性: {attribute!r}（可选: {'/'.join(ATTRIBUTES)}）"
     if weapon_group not in WEAPON_GROUPS:
         return (
